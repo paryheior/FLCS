@@ -1,7 +1,6 @@
 from __future__ import absolute_import
-import imp
 from model.fm import FactorizationMachineModel
-from model.warm import MWUF, MetaE, CVAR, DIFF  
+from model.warm import MWUF, MetaE, CVAR, DIFF, FLOW
 from model.wd import WideAndDeep
 from model.deepfm import DeepFactorizationMachineModel
 from model.afn import AdaptiveFactorizationNetwork

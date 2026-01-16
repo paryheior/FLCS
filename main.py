@@ -8,12 +8,32 @@ from sklearn.metrics import roc_auc_score, f1_score
 import argparse
 from data import MovieLens1MColdStartDataLoader, TaobaoADColdStartDataLoader, CIKMColdStartDataLoader
 from model import FactorizationMachineModel, WideAndDeep, DeepFactorizationMachineModel, AdaptiveFactorizationNetwork, ProductNeuralNetworkModel
-from model import AttentionalFactorizationMachineModel, DeepCrossNetworkModel, MWUF, MetaE, CVAR, DIFF
+from model import AttentionalFactorizationMachineModel, DeepCrossNetworkModel, MWUF, MetaE, CVAR, DIFF, FLOW
 from model.wd import WideAndDeep
+# import builtins
+# import inspect
+import time
+# # 备份原系统的 print 函数
+# _original_print = builtins.print
+
+# def trace_print(*args, **kwargs):
+#     # 获取调用栈的上一帧（即是谁调用了 print）
+#     caller_frame = inspect.currentframe().f_back
+#     if caller_frame:
+#         filename = caller_frame.f_code.co_filename
+#         lineno = caller_frame.f_lineno
+#         # 在打印内容前加上 [文件名:行号]
+#         _original_print(f"[\033[93m{filename}:{lineno}\033[0m] ", end="")
+    
+#     # 调用原始的 print
+#     _original_print(*args, **kwargs)
+
+# # 覆盖系统的 print
+# builtins.print = trace_print
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pretrain_model_path', default='')
+    parser.add_argument('--pretrain_model_path', default='./chkpt/')
     parser.add_argument('--dataset_name', default='taobaoAD', help='required to be one of [movielens1M, taobaoAD]')
     parser.add_argument('--datahub_path', default='./datahub/')
     parser.add_argument('--warmup_model', default='cvar', help="required to be one of [base, mwuf, metaE, cvar, cvar_init]")
@@ -26,6 +46,11 @@ def get_args():
     parser.add_argument('--cvar_iters', type=int, default=10)
     parser.add_argument('--diff_epochs', type=int, default=2)
     parser.add_argument('--diff_iters', type=int, default=10)
+    
+    parser.add_argument('--flow_epochs', type=int, default=2)
+    parser.add_argument('--flow_iters', type=int, default=10)
+    parser.add_argument('--inference_steps', type=int, default=10)
+    
     parser.add_argument('--diff_coef', type=float)    
     parser.add_argument("--T",            type=int, default=6)
     parser.add_argument("--w",            type=float, default=1.8)
@@ -368,6 +393,7 @@ def cvar(model,
     save_path = os.path.join(save_dir, 'model.pth')
     train_base = dataloaders['train_base']
     # train cvar
+    total_training_time = 0.0
     warm_model = CVAR(model, 
                     warm_features=dataloaders.item_features,
                     train_loader=train_base,
@@ -391,11 +417,11 @@ def cvar(model,
                     warm_model.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    a, b, c, d = a + loss.item(), b + main_loss.item(), c + recon_term.item(), d + reg_term.item()
+                    a, b, c, d = a + loss, b + main_loss, c + recon_term, d + reg_term
                 a, b, c, d = a/iters, b/iters, c/iters, d/iters
                 if logger and (i + 1) % 10 == 0:
                     print("    Iter {}/{}, loss: {:.4f}, main loss: {:.4f}, recon loss: {:.4f}, reg loss: {:.4f}" \
-                            .format(i + 1, batch_num, a, b, c, d), end='\r')
+                            .format(i + 1, batch_num, a.item(), b.item(), c.item(), d.item()), end='\n')
         # warm-up item id embedding
         train_a = dataloaders['train_warm_a']
         for (features, label) in train_a:
@@ -403,7 +429,12 @@ def cvar(model,
             warm_item_id_emb, _, _ = warm_model.warm_item_id(features)
             indexes = features[warm_model.item_id_name].squeeze()
             origin_item_id_emb[indexes, ] = warm_item_id_emb
+    if torch.cuda.is_available(): torch.cuda.synchronize() # 确保GPU同步，计时更准
+    start_t = time.time()
     warm_up(train_base, epochs=1, iters=cvar_iters, logger=True)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    end_t = time.time()
+    total_training_time += (end_t - start_t)
     # test by steps 
     dataset_list = ['train_warm_a', 'train_warm_b', 'train_warm_c', 'test']
     auc_list, f1_list = [], []
@@ -411,8 +442,8 @@ def cvar(model,
         print("#"*10, dataset_list[i],'#'*10)
         train_s = dataset_list[i]
         auc, f1 = test(warm_model.model, dataloaders['test'], device)
-        auc_list.append(auc.item())
-        f1_list.append(f1.item())
+        auc_list.append(auc)
+        f1_list.append(f1)
         print("[cvar] evaluate on [test dataset] auc: {:.4f}, F1 score: {:.4f}".format(auc, f1))
         if i < len(dataset_list) - 1:
             warm_model.model.only_optimize_itemid()
@@ -449,6 +480,7 @@ def diff(model,
     save_path = os.path.join(save_dir, 'model.pth')
     train_base = dataloaders['train_base']
     # train diff
+    total_training_time = 0.0
     warm_model = DIFF(model, 
                     warm_features=dataloaders.item_features,
                     train_loader=train_base,
@@ -480,19 +512,23 @@ def diff(model,
                     warm_model.zero_grad()
                     loss.backward()
                     optimizer.step()
-                    a, b, c, d = a + loss.item(), b + main_loss.item(), c + recon_term.item(), d + reg_term.item()
+                    a, b, c, d = a + loss, b + main_loss, c + recon_term, d + reg_term
                 a, b, c, d = a/iters, b/iters, c/iters, d/iters
                 if logger and (i + 1) % 10 == 0:
-                    print("    Iter {}/{}, loss: {:.4f}, main loss: {:.4f}, recon loss: {:.4f}, reg loss: {:.4f}" \
-                            .format(i + 1, batch_num, a, b, c, d), end='\r')
-        # warm-up item id embedding
+                    print(b)
+                    # warm-up item id embedding
         train_a = dataloaders['train_warm_a']
         for (features, label) in train_a:
             origin_item_id_emb = warm_model.model.emb_layer[warm_model.item_id_name].weight.data
             warm_item_id_emb, _, _ = warm_model.warm_item_id(features)
             indexes = features[warm_model.item_id_name].squeeze()
             origin_item_id_emb[indexes, ] = warm_item_id_emb
+    if torch.cuda.is_available(): torch.cuda.synchronize() # 确保GPU同步，计时更准
+    start_t = time.time()
     warm_up(train_base, epochs=1, iters=diff_iters, logger=True)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    end_t = time.time()
+    total_training_time += (end_t - start_t)
     # test by steps 
     dataset_list = ['train_warm_a', 'train_warm_b', 'train_warm_c', 'test']
     auc_list, f1_list = [], []
@@ -500,16 +536,108 @@ def diff(model,
         print("#"*10, dataset_list[i],'#'*10)
         train_s = dataset_list[i]
         auc, f1 = test(warm_model.model, dataloaders['test'], device)
-        auc_list.append(auc.item())
-        f1_list.append(f1.item())
+        auc_list.append(auc)
+        f1_list.append(f1)
         print("[diff] evaluate on [test dataset] auc: {:.4f}, F1 score: {:.4f}".format(auc, f1))
         if i < len(dataset_list) - 1:
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            loop_start_t = time.time()
             warm_model.model.only_optimize_itemid()
             train(warm_model.model, dataloaders[train_s], device, epoch, lr, weight_decay, save_path)
             if not only_init:
                 warm_up(dataloaders[train_s], epochs=diff_epochs, iters=diff_iters, logger=False)
-    print("*"*20, "diff", "*"*20)
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            loop_end_t = time.time()
+            total_training_time += (loop_end_t - loop_start_t)
+            
+    max_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2) # 转换为 MB
+    print(f"\n[Resource Cost] Total Training Time: {total_training_time:.4f} s")
+    print(f"[Resource Cost] Peak GPU Memory: {max_memory:.4f} MB")
+    print("*" * 20, "Flow Matching Cold Rec Finished", "*" * 20)
     return auc_list, f1_list
+
+def flow(model,
+         dataloaders,
+         model_name,
+         epoch,
+         flow_epochs,
+         flow_iters,
+         lr,
+         weight_decay,
+         device,
+         save_dir,
+         timesteps,
+         inference_steps,
+         only_init=False):
+    print("*" * 20, "FLOW", "*" * 20)
+    device = torch.device(device)
+    save_dir = os.path.join(save_dir, model_name)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    save_path = os.path.join(save_dir, 'model.pth')
+    train_base = dataloaders['train_base']
+    # train diff
+    warm_model = FLOW(model,
+                      warm_features=dataloaders.item_features,
+                      train_loader=train_base,
+                      device=device,
+                      timesteps=timesteps,
+                      inference_steps = inference_steps).to(device)
+    warm_model.init_flow()
+
+    def warm_up(dataloader, epochs, iters, logger=False):
+        warm_model.train()
+        criterion = torch.nn.BCELoss()
+        warm_model.optimize_flow()
+        optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, warm_model.parameters()), lr=lr, weight_decay=weight_decay)
+        batch_num = len(dataloader)
+        # train warm-up model
+        for e in range(epochs):
+            for i, (features, label) in enumerate(dataloader):
+                a, b, c, d = 0.0, 0.0, 0.0, 0.0
+                for _ in range(iters):
+                    target, recon_term, reg_term = warm_model(features)
+                    main_loss = criterion(target, label.float())
+                    # loss = main_loss + recon_term + 1e-4 * reg_term * 10000 #taobao AD
+                    loss = main_loss + recon_term + 1e-4 * reg_term * 10     #ML-1M
+                    # loss = main_loss + recon_term + reg_term 
+                    warm_model.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    a, b, c, d = a + loss, b + main_loss, c + recon_term, d + reg_term
+                a, b, c, d = a / iters, b / iters, c / iters, d / iters
+                if logger and (i + 1) % 10 == 0:
+                    print("    Iter {}/{}, loss: {:.4f}, main loss: {:.4f}, recon loss: {:.4f}, reg loss: {:.4f}" \
+                            .format(i + 1, batch_num, a.item(), b.item(), c.item(), d.item()), end='\r')
+                # if logger and (i + 1) % 10 == 0:
+                #     print(b)
+                # warm-up item id embedding
+        train_a = dataloaders['train_warm_a']
+        for (features, label) in train_a:
+            origin_item_id_emb = warm_model.model.emb_layer[warm_model.item_id_name].weight.data
+            warm_item_id_emb, _, _ = warm_model.warm_item_id(features)
+            indexes = features[warm_model.item_id_name].squeeze()
+            origin_item_id_emb[indexes,] = warm_item_id_emb
+
+    warm_up(train_base, epochs=2, iters=flow_iters, logger=True)
+    # test by steps
+    dataset_list = ['train_warm_a', 'train_warm_b', 'train_warm_c', 'test']
+    auc_list, f1_list = [], []
+    for i, train_s in enumerate(dataset_list):
+        print("#" * 10, dataset_list[i], '#' * 10)
+        train_s = dataset_list[i]
+        auc, f1 = test(warm_model.model, dataloaders['test'], device)
+        auc_list.append(auc)
+        f1_list.append(f1)
+        print("[FLOW] evaluate on [test dataset] auc: {:.4f}, F1 score: {:.4f}".format(auc, f1))
+        if i < len(dataset_list) - 1:
+            warm_model.model.only_optimize_itemid()
+            train(warm_model.model, dataloaders[train_s], device, epoch, lr, weight_decay, save_path)
+            if not only_init:
+                warm_up(dataloaders[train_s], epochs=flow_epochs, iters=flow_iters, logger=False)
+    print("*" * 20, "FLOW", "*" * 20)
+    return auc_list, f1_list
+
 
 def run(model, dataloaders, args, model_name, warm):
     if warm == 'base':
@@ -528,7 +656,7 @@ def run(model, dataloaders, args, model_name, warm):
                                  args.weight_decay, args.device, args.save_dir,
                                  args.T, args.w, args.v,
                                  args.noise_scale, args.noise_min, args.noise_max,
-                                 args.eta, args.timesteps
+                                 args.eta, args.timesteps, args.diff_coef
                                  )        
     elif warm == 'diff_init':
         auc_list, f1_list = diff(model, dataloaders, model_name, args.epoch,
@@ -538,6 +666,12 @@ def run(model, dataloaders, args, model_name, warm):
                                  args.noise_scale, args.noise_min, args.noise_max,
                                  args.eta, args.timesteps,
                                  only_init=True)
+    elif warm == 'flow':
+        auc_list, f1_list = flow(model, dataloaders, model_name, args.epoch,
+                         args.diff_epochs, args.diff_iters, args.lr,
+                         args.weight_decay, args.device, args.save_dir,
+                         args.timesteps,args.inference_steps,
+                         only_init=True)
     return auc_list, f1_list
 
 if __name__ == '__main__':
@@ -553,11 +687,12 @@ if __name__ == '__main__':
     drop_suffix = '-dropoutnet' if args.is_dropoutnet else ''
     model_path = os.path.join(args.pretrain_model_path, args.model_name + drop_suffix + '-{}-{}'.format(args.dataset_name, args.seed))
     if os.path.exists(model_path):
-        model = torch.load(model_path).to(args.device)
+        model = torch.load(model_path, weights_only=False).to(args.device)
         dataloaders = get_loaders(args.dataset_name, args.datahub_path, args.device, args.bsz, args.shuffle==1)
     else:
         model, dataloaders = pretrain(args.dataset_name, args.datahub_path, args.bsz, args.shuffle, args.model_name, \
             args.epoch, args.lr, args.weight_decay, args.device, args.save_dir, args.is_dropoutnet)
+        
         if len(args.pretrain_model_path) > 0:
             torch.save(model, model_path)
     # warmup train and test
